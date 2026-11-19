@@ -3,9 +3,13 @@ import requests
 from datetime import datetime
 from playwright.sync_api import sync_playwright
 
-MOVIE_KEYWORDS = ["avengers: doomsday", "avengers doomsday", "doomsday"]
-CITY_URL = "https://in.bookmyshow.com/explore/movies-chennai"
+MOVIE_URL = "https://in.bookmyshow.com/movies/chennai/avengers-doomsday/ET00439706"
+SHOWTIMES_URL = "https://in.bookmyshow.com/buytickets/avengers-doomsday-chennai/movie-chen-ET00439706-MT/20261217"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
+
+# Optional: Put specific Chennai theatres here if you ONLY want alerts for them
+# Leave empty [] to get alerted for ANY open Chennai theatre
+TARGET_THEATRES = []  # Example: ["sathyam", "palazzo", "luxe", "vr chennai", "ags"]
 
 def send_phone_alert(title, message, link):
     if not NTFY_TOPIC:
@@ -19,7 +23,7 @@ def send_phone_alert(title, message, link):
             "Priority": "urgent",
             "Tags": "rotating_light,ticket",
             "Click": link,
-            "Actions": f"view, Open BookMyShow, {link}"
+            "Actions": f"view, Book Tickets Now, {link}"
         },
         timeout=10
     )
@@ -27,43 +31,74 @@ def send_phone_alert(title, message, link):
 
 def check_bookings():
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            viewport={"width": 1366, "height": 768}
         )
         page = context.new_page()
 
         try:
-            page.goto(CITY_URL, wait_until="domcontentloaded", timeout=30000)
+            # 1. Check the direct Chennai Avengers: Doomsday movie page
+            page.goto(MOVIE_URL, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(4000)
-            page_text = page.inner_text("body").lower()
+            print("Page title:", page.title())
 
-            for keyword in MOVIE_KEYWORDS:
-                if keyword in page_text:
-                    for link in page.locator("a").all():
-                        href = link.get_attribute("href") or ""
-                        text = (link.inner_text() or "").lower()
-                        if "doomsday" in text and "/buytickets/" in href:
-                            full_url = f"https://in.bookmyshow.com{href}" if href.startswith("/") else href
-                            browser.close()
-                            return True, full_url
+            body_text = page.inner_text("body").lower()
+            if "just a moment" in body_text or "attention required" in body_text:
+                print("Blocked by Cloudflare on this run. Will retry next cycle.")
+                browser.close()
+                return False, None
 
+            # 2. Check the Dec 17 Chennai showtimes page for open theatres
+            page.goto(SHOWTIMES_URL, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(4000)
+
+            venue_links = page.locator("a[href*='/cinemas/chennai/']").all()
+            open_theatres = []
+            for v in venue_links:
+                name = (v.inner_text() or "").strip()
+                if name and name not in open_theatres:
+                    open_theatres.append(name)
+
+            print(f"Open Chennai theatres found ({len(open_theatres)}):", open_theatres)
+
+            if TARGET_THEATRES:
+                matched = [
+                    t for t in open_theatres
+                    if any(target.lower() in t.lower() for target in TARGET_THEATRES)
+                ]
+                browser.close()
+                return (len(matched) > 0), matched
+
+            # Fallback: check if "Book tickets" button is active on the main movie page
+            book_btn_visible = "book tickets" in body_text
             browser.close()
-            return False, None
+            return (len(open_theatres) > 0 or book_btn_visible), open_theatres
+
         except Exception as e:
             print(f"Error checking page: {e}")
             browser.close()
             return False, None
 
 if __name__ == "__main__":
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Scanning Chennai listings...")
-    is_open, booking_link = check_bookings()
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Scanning Chennai theaters for Avengers: Doomsday...")
+    is_open, theatres = check_bookings()
 
     if is_open:
+        if theatres:
+            preview = ", ".join(theatres[:5])
+            msg = f"Open at {len(theatres)} Chennai theatre(s): {preview}. Tap to book!"
+        else:
+            msg = "Book Tickets button is LIVE for Chennai! Tap now to grab seats."
+
         send_phone_alert(
-            "DOOMSDAY BOOKINGS OPEN IN CHENNAI!",
-            "Tickets are live! Tap now to grab IMAX/SPI/PVR seats.",
-            booking_link
+            "DOOMSDAY TICKETS LIVE IN CHENNAI!",
+            msg,
+            MOVIE_URL
         )
     else:
-        print("Not open yet.")
+        print("Target theatres not open yet.")
